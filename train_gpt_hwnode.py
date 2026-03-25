@@ -811,14 +811,18 @@ class HWNodeBlock(nn.Module):
         """Apply spectral normalization to A_weight using one-step power iteration.
         Returns A / sigma_max(A), guaranteeing ||A||_2 <= 1."""
         A = self.A_weight
-        u = self._pi_u
-        v_new = F.normalize(A.T @ u, dim=0)
-        u_new = F.normalize(A @ v_new, dim=0)
-        # Update buffers in-place (compile-safe, detached)
-        self._pi_u.copy_(u_new.detach())
-        self._pi_v.copy_(v_new.detach())
-        # sigma = u^T A v
-        sigma = (u_new @ A @ v_new).clamp(min=1e-8)
+        with torch.no_grad():
+            u = self._pi_u
+            v_new = F.normalize(A.T @ u, dim=0)
+            u_new = F.normalize(A @ v_new, dim=0)
+            # Update buffers in-place (compile-safe, detached)
+            self._pi_u.copy_(u_new)
+            self._pi_v.copy_(v_new)
+        
+        # Compute sigma with grad tracing so A gets gradients from normalization
+        u_final = self._pi_u.clone().detach()
+        v_final = self._pi_v.clone().detach()
+        sigma = (u_final @ A @ v_final).clamp(min=1e-8)
         return A / sigma
 
     def forward(self, x: Tensor) -> Tensor:
