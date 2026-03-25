@@ -1944,6 +1944,8 @@ def main() -> None:
         canon_last_n=args.canon_last_n,
         canon_kernel=args.canon_kernel,
         canon_delta_gate_init=args.canon_delta_gate_init,
+        hwnode_state_dim=args.hwnode_state_dim,
+        hwnode_order=args.hwnode_order,
     ).to(device).bfloat16()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
