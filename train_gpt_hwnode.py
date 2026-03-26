@@ -163,7 +163,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.5))
-    hwnode_state_dim = int(os.environ.get("HWNODE_STATE_DIM", 936))
+    hwnode_state_dim = int(os.environ.get("HWNODE_STATE_DIM", 864))
     hwnode_order = int(os.environ.get("HWNODE_ORDER", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -729,7 +729,7 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  rope_base: float, qk_gain_init: float, layer_idx: int = 0,
                  ln_scale: bool = False, dtg: bool = False,
-                 hwnode_state_dim: int = 936, hwnode_order: int = 2):
+                 hwnode_state_dim: int = 864, hwnode_order: int = 2):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -764,7 +764,7 @@ class GPT(nn.Module):
                  bigram_vocab_size: int = 0, bigram_dim: int = 128, xsa_last_n: int = 0,
                  rope_dims: int = 0, ln_scale: bool = False, dtg: bool = False,
                  ve_enabled: bool = False, ve_dim: int = 128, ve_layers: str = "9,10",
-                 hwnode_state_dim: int = 936, hwnode_order: int = 2):
+                 hwnode_state_dim: int = 864, hwnode_order: int = 2):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)
         if logit_softcap <= 0.0:
