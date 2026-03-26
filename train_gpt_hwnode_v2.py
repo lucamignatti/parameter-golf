@@ -53,6 +53,9 @@ class Hyperparameters(base.Hyperparameters):
     ngram_entropy_center = float(os.environ.get("NGRAM_ENTROPY_CENTER", 3.0))
     ngram_entropy_scale = float(os.environ.get("NGRAM_ENTROPY_SCALE", 2.0))
     ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", 2))
+    hwnode_term_gates = bool(int(os.environ.get("HWNODE_TERM_GATES", "0")))
+    hwnode_state_bias = bool(int(os.environ.get("HWNODE_STATE_BIAS", "0")))
+    hwnode_term_gate_init = float(os.environ.get("HWNODE_TERM_GATE_INIT", "1.0"))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
 
 
@@ -166,6 +169,55 @@ def make_adam(params, *, lr: float, betas: tuple[float, float], eps: float, fuse
         betas=betas,
         eps=eps,
     )
+
+
+class HWNodeBlockV2(base.HWNodeBlock):
+    def __init__(self, dim: int, state_dim: int, order: int = 3):
+        super().__init__(dim, state_dim, order=order)
+        self.use_term_gates = os.environ.get("HWNODE_TERM_GATES", "0") == "1"
+        self.use_state_bias = os.environ.get("HWNODE_STATE_BIAS", "0") == "1"
+        gate_init = float(os.environ.get("HWNODE_TERM_GATE_INIT", "1.0"))
+        if self.use_term_gates:
+            self.term_gates = nn.Parameter(torch.full((order,), gate_init, dtype=torch.float32))
+        else:
+            self.register_parameter("term_gates", None)
+        if self.use_state_bias:
+            self.state_bias = nn.Parameter(torch.zeros(state_dim, dtype=torch.float32))
+        else:
+            self.register_parameter("state_bias", None)
+
+    def _exp_A(self, device, dtype):
+        use_cache = not self.training and not torch.is_grad_enabled()
+        if use_cache and self._cached_exp_A is not None:
+            return self._cached_exp_A
+
+        A_normed = self._spectral_norm_A()
+        A = (A_normed * self.dt).to(dtype=dtype)
+        I = torch.eye(A.shape[0], device=device, dtype=dtype)
+        result, Ak = I.clone(), I.clone()
+        if self.term_gates is None:
+            for k in range(1, self.order + 1):
+                Ak = Ak @ A / k
+                result = result + Ak
+        else:
+            gates = self.term_gates.to(dtype=dtype)
+            for k in range(1, self.order + 1):
+                Ak = Ak @ A / k
+                result = result + gates[k - 1] * Ak
+
+        if use_cache:
+            self._cached_exp_A = result
+        return result
+
+    def forward(self, x: Tensor) -> Tensor:
+        z = F.leaky_relu(self.fc(x), negative_slope=0.5)
+        z = z @ self._exp_A(x.device, x.dtype).T
+        if self.state_bias is not None:
+            z = z + self.state_bias.to(dtype=z.dtype)[None, None, :]
+        return self.proj(F.leaky_relu(z, negative_slope=0.5).square())
+
+
+base.HWNodeBlock = HWNodeBlockV2
 
 
 def make_model(args: Hyperparameters, device: torch.device) -> GPT:
@@ -580,7 +632,10 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     log0(f"attention_backend:{attention_backend} compile:{use_compile} fused_optim:{fused_optim}")
-    log0(f"hwnode:state_dim={args.hwnode_state_dim} order={args.hwnode_order}")
+    log0(
+        f"hwnode:state_dim={args.hwnode_state_dim} order={args.hwnode_order} "
+        f"term_gates={args.hwnode_term_gates} state_bias={args.hwnode_state_bias}"
+    )
     log0(f"ngram:enabled={args.ngram_enabled} orders={args.ngram_min_order}-{args.ngram_max_order} buckets={args.ngram_num_buckets}")
 
     base.CastedLinear._qat_enabled = args.qat_enabled
