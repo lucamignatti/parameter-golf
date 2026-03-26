@@ -200,6 +200,25 @@ def make_model(args: Hyperparameters, device: torch.device) -> GPT:
     return model
 
 
+def get_gpu_info_text() -> str:
+    commands = [
+        ["nvidia-smi"],
+        ["rocm-smi"],
+    ]
+    for cmd in commands:
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        except FileNotFoundError:
+            continue
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        if out:
+            return out
+        if err:
+            return err
+    return "gpu_info: unavailable"
+
+
 _NGRAM_PRIMES = np.array(
     [36313, 27191, 51647, 81929, 131071, 174763, 233017, 286291, 343597, 425143, 524287, 786433],
     dtype=np.int64,
@@ -538,10 +557,7 @@ def main() -> None:
 
     log0(code, console=False)
     log0(f"Python {sys.version} PyTorch {torch.__version__}", console=False)
-    log0(
-        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
-        console=False,
-    )
+    log0(get_gpu_info_text(), console=False)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
