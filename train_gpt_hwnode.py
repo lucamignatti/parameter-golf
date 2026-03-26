@@ -148,7 +148,7 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.5))
     hwnode_state_dim = int(os.environ.get("HWNODE_STATE_DIM", 936))
-    hwnode_order = int(os.environ.get("HWNODE_ORDER", 3))
+    hwnode_order = int(os.environ.get("HWNODE_ORDER", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -665,6 +665,13 @@ class HWNodeBlock(nn.Module):
         self.dt = nn.Parameter(torch.ones(1))
         self.register_buffer('_pi_u', F.normalize(torch.randn(state_dim), dim=0), persistent=False)
         self.register_buffer('_pi_v', F.normalize(torch.randn(state_dim), dim=0), persistent=False)
+        self.register_buffer('_cached_exp_A', None, persistent=False)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if mode:
+            self._cached_exp_A = None
+        return self
 
     def _spectral_norm_A(self) -> Tensor:
         A = self.A_weight
@@ -680,6 +687,9 @@ class HWNodeBlock(nn.Module):
         return A / sigma
 
     def _exp_A(self, device, dtype):
+        if not self.training and self._cached_exp_A is not None:
+            return self._cached_exp_A
+
         A_normed = self._spectral_norm_A()
         A = (A_normed * self.dt).to(dtype=dtype)
         I = torch.eye(A.shape[0], device=device, dtype=dtype)
@@ -687,6 +697,10 @@ class HWNodeBlock(nn.Module):
         for k in range(1, self.order + 1):
             Ak = Ak @ A / k
             result = result + Ak
+            
+        if not self.training:
+            self._cached_exp_A = result
+
         return result
 
     def forward(self, x: Tensor) -> Tensor:
@@ -698,7 +712,7 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  rope_base: float, qk_gain_init: float, layer_idx: int = 0,
                  ln_scale: bool = False, dtg: bool = False,
-                 hwnode_state_dim: int = 936, hwnode_order: int = 3):
+                 hwnode_state_dim: int = 936, hwnode_order: int = 2):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -733,7 +747,7 @@ class GPT(nn.Module):
                  bigram_vocab_size: int = 0, bigram_dim: int = 128, xsa_last_n: int = 0,
                  rope_dims: int = 0, ln_scale: bool = False, dtg: bool = False,
                  ve_enabled: bool = False, ve_dim: int = 128, ve_layers: str = "9,10",
-                 hwnode_state_dim: int = 936, hwnode_order: int = 3):
+                 hwnode_state_dim: int = 936, hwnode_order: int = 2):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)
         if logit_softcap <= 0.0:
