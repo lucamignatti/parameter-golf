@@ -358,7 +358,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,A_weight",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale",
     ).split(",")
     if pattern
 )
@@ -703,7 +703,8 @@ class HWNodeBlock(nn.Module):
         return A / sigma
 
     def _exp_A(self, device, dtype):
-        if not self.training and self._cached_exp_A is not None:
+        use_cache = not self.training and not torch.is_grad_enabled()
+        if use_cache and self._cached_exp_A is not None:
             return self._cached_exp_A
 
         A_normed = self._spectral_norm_A()
@@ -714,7 +715,7 @@ class HWNodeBlock(nn.Module):
             Ak = Ak @ A / k
             result = result + Ak
             
-        if not self.training:
+        if use_cache:
             self._cached_exp_A = result
 
         return result
@@ -1239,9 +1240,9 @@ def eval_val_sliding_ttt(
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
-    if ".mlp." in name:
+    if ".mlp." in name or ".hwnode." in name:
         return "mlp"
-    if ".attn." in name or (".proj." in name and ".mlp." not in name):
+    if ".attn." in name or (".proj." in name and ".mlp." not in name and ".hwnode." not in name):
         return "attn"
     return "other"
 
@@ -1413,12 +1414,12 @@ def main() -> None:
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS) and "A_weight" not in name
     ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS) or "A_weight" in name
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
