@@ -704,7 +704,7 @@ class HWNodeBlock(nn.Module):
         return result
 
     def forward(self, x: Tensor) -> Tensor:
-        z = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
+        z = F.leaky_relu(self.fc(x), negative_slope=0.5)
         z = z @ self._exp_A(x.device, x.dtype).T
         return self.proj(F.leaky_relu(z, negative_slope=0.5).square())
 
