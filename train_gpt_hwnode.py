@@ -89,6 +89,11 @@ class BackoffNgramMixer:
         uniform_nll = math.log(self.V)
         ngram_p = np.zeros((bsz, slen), dtype=np.float64)
         ngram_hit = np.zeros((bsz, slen), dtype=np.bool_)
+        ngram_order_hit = np.zeros((bsz, slen), dtype=np.int32)
+        
+        # Cubric adaptive per-order alpha multipliers
+        cubric_scales = {2: 0.30, 3: 0.45, 4: 1.0, 5: 1.88, 6: 2.0, 7: 2.0}
+        
         for oi_rev in range(5, -1, -1):
             order = oi_rev + 2
             cw = order - 1
@@ -114,9 +119,20 @@ class BackoffNgramMixer:
             p = np.clip(p, 0.0, 1.0)
             ngram_p[valid] = p[valid]
             ngram_hit[valid] = True
+            ngram_order_hit[valid] = order
+            
         ngram_p[~ngram_hit] = 1.0 / self.V
         ngram_p_t = torch.tensor(ngram_p, device=device, dtype=torch.float32)
-        mixed_p = (1.0 - alpha) * neural_p + alpha * ngram_p_t
+        
+        # Apply Cubric scaling to the adaptive base-entropy alpha
+        alpha_scale_np = np.ones((bsz, slen), dtype=np.float32)
+        for ord_val, scale in cubric_scales.items():
+            alpha_scale_np[ngram_order_hit == ord_val] = scale
+            
+        alpha_scale_t = torch.tensor(alpha_scale_np, device=device)
+        eff_alpha = (alpha * alpha_scale_t).clamp(max=0.95)
+        
+        mixed_p = (1.0 - eff_alpha) * neural_p + eff_alpha * ngram_p_t
         mixed_nll = -torch.log(mixed_p.clamp(min=1e-12))
         return mixed_nll, None
 
