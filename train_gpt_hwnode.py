@@ -342,7 +342,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,A_weight",
     ).split(",")
     if pattern
 )
@@ -690,9 +690,9 @@ class HWNodeBlock(nn.Module):
         return result
 
     def forward(self, x: Tensor) -> Tensor:
-        z = torch.relu(self.fc(x)).square()
+        z = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
         z = z @ self._exp_A(x.device, x.dtype).T
-        return self.proj(torch.relu(z).square())
+        return self.proj(F.leaky_relu(z, negative_slope=0.5).square())
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
