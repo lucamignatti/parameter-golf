@@ -63,7 +63,53 @@ class Hyperparameters(base.Hyperparameters):
     hwnode_term_gates = bool(int(os.environ.get("HWNODE_TERM_GATES", "0")))
     hwnode_state_bias = bool(int(os.environ.get("HWNODE_STATE_BIAS", "0")))
     hwnode_term_gate_init = float(os.environ.get("HWNODE_TERM_GATE_INIT", "1.0"))
+    hwnode_a_int8 = bool(int(os.environ.get("HWNODE_A_INT8", "0")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+
+
+def mixed_quantize_int6_v2(
+    state_dict: dict[str, Tensor],
+    int6_cats: set[str],
+    *,
+    hwnode_a_int8: bool = False,
+):
+    """Quantize like the base exporter, with an optional int8 override for A_weight.
+
+    The shared HWNODE dynamics matrix is applied repeatedly across virtual depth
+    steps, so quantization noise there compounds more than in a standard MLP.
+    This hook lets us keep that matrix on the less aggressive int8 path while
+    leaving the rest of the model unchanged.
+    """
+    result: dict[str, Tensor] = {}
+    meta: dict[str, object] = {}
+    for name, tensor in state_dict.items():
+        t = tensor.detach().cpu().contiguous()
+        cat = base._classify_param(name)
+        if not t.is_floating_point() or t.numel() <= 65536:
+            result[name] = t.to(torch.float16) if t.is_floating_point() else t
+            meta[name] = "passthrough"
+            continue
+        if any(p in name for p in base.CONTROL_TENSOR_NAME_PATTERNS):
+            result[name] = t.float()
+            meta[name] = "passthrough_ctrl"
+            continue
+        if hwnode_a_int8 and name.endswith(".hwnode.A_weight"):
+            q, s = base.quantize_float_tensor(t)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int8"}
+            continue
+        if cat in int6_cats and t.ndim >= 1:
+            q, s = base.quantize_int6_per_row(t)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int6"}
+        else:
+            q, s = base.quantize_float_tensor(t)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int8"}
+    return result, meta
 
 
 def load_validation_tokens(pattern: str, seq_len: int, token_limit: int = 0) -> Tensor:
@@ -733,7 +779,8 @@ def main() -> None:
     log0(
         f"hwnode:state_dim={args.hwnode_state_dim} order={args.hwnode_order} "
         f"virtual_layers={args.hwnode_virtual_layers} "
-        f"term_gates={args.hwnode_term_gates} state_bias={args.hwnode_state_bias}"
+        f"term_gates={args.hwnode_term_gates} state_bias={args.hwnode_state_bias} "
+        f"a_int8={args.hwnode_a_int8}"
     )
     log0(f"ngram:enabled={args.ngram_enabled} orders={args.ngram_min_order}-{args.ngram_max_order} buckets={args.ngram_num_buckets}")
 
@@ -1013,7 +1060,11 @@ def main() -> None:
                 tensor[tensor.abs() < thresh] = 0.0
         log0(f"pruning:{args.prune_pct * 100:.1f}% magnitude pruning applied")
 
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
+    quant_result, quant_meta = mixed_quantize_int6_v2(
+        sd_cpu,
+        {"mlp", "attn"},
+        hwnode_a_int8=args.hwnode_a_int8,
+    )
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
