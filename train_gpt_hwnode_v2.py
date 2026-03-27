@@ -53,6 +53,7 @@ class Hyperparameters(base.Hyperparameters):
     ngram_entropy_center = float(os.environ.get("NGRAM_ENTROPY_CENTER", 3.0))
     ngram_entropy_scale = float(os.environ.get("NGRAM_ENTROPY_SCALE", 2.0))
     ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", 2))
+    hwnode_virtual_layers = int(os.environ.get("HWNODE_VIRTUAL_LAYERS", 2))
     hwnode_term_gates = bool(int(os.environ.get("HWNODE_TERM_GATES", "0")))
     hwnode_state_bias = bool(int(os.environ.get("HWNODE_STATE_BIAS", "0")))
     hwnode_term_gate_init = float(os.environ.get("HWNODE_TERM_GATE_INIT", "1.0"))
@@ -172,8 +173,23 @@ def make_adam(params, *, lr: float, betas: tuple[float, float], eps: float, fuse
 
 
 class HWNodeBlockV2(base.HWNodeBlock):
+    """Shared-depth Hammerstein-Wiener Neural ODE block.
+
+    This is the intended HWNODE construction:
+
+        h_0 = x
+        z_l(0) = phi(W_in h_l)
+        z_l(Δt) = exp(A Δt) z_l(0)
+        h_{l+1} = psi(W_out z_l(Δt))
+
+    for l = 0, ..., L-1, with the SAME parameters reused at every virtual
+    depth step. The Taylor expansion only approximates exp(A Δt); the virtual
+    depth itself comes from repeatedly applying this shared HW step.
+    """
+
     def __init__(self, dim: int, state_dim: int, order: int = 3):
         super().__init__(dim, state_dim, order=order)
+        self.num_virtual_layers = int(os.environ.get("HWNODE_VIRTUAL_LAYERS", "2"))
         self.use_term_gates = os.environ.get("HWNODE_TERM_GATES", "0") == "1"
         self.use_state_bias = os.environ.get("HWNODE_STATE_BIAS", "0") == "1"
         gate_init = float(os.environ.get("HWNODE_TERM_GATE_INIT", "1.0"))
@@ -209,12 +225,21 @@ class HWNodeBlockV2(base.HWNodeBlock):
             self._cached_exp_A = result
         return result
 
-    def forward(self, x: Tensor) -> Tensor:
+    def _shared_hwnode_step(self, x: Tensor, exp_a: Tensor) -> Tensor:
+        """Apply one shared HWNODE step."""
         z = F.leaky_relu(self.fc(x), negative_slope=0.5)
-        z = z @ self._exp_A(x.device, x.dtype).T
+        z = z @ exp_a.T
         if self.state_bias is not None:
             z = z + self.state_bias.to(dtype=z.dtype)[None, None, :]
-        return self.proj(F.leaky_relu(z, negative_slope=0.5).square())
+        y = self.proj(z)
+        return F.leaky_relu(y, negative_slope=0.5).square()
+
+    def forward(self, x: Tensor) -> Tensor:
+        exp_a = self._exp_A(x.device, x.dtype)
+        h = x
+        for _ in range(self.num_virtual_layers):
+            h = self._shared_hwnode_step(h, exp_a)
+        return h
 
 
 base.HWNodeBlock = HWNodeBlockV2
@@ -634,6 +659,7 @@ def main() -> None:
     log0(f"attention_backend:{attention_backend} compile:{use_compile} fused_optim:{fused_optim}")
     log0(
         f"hwnode:state_dim={args.hwnode_state_dim} order={args.hwnode_order} "
+        f"virtual_layers={args.hwnode_virtual_layers} "
         f"term_gates={args.hwnode_term_gates} state_bias={args.hwnode_state_bias}"
     )
     log0(f"ngram:enabled={args.ngram_enabled} orders={args.ngram_min_order}-{args.ngram_max_order} buckets={args.ngram_num_buckets}")
