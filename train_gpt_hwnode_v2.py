@@ -20,7 +20,12 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+import train_gpt as mlp_base
 import train_gpt_hwnode as base
+
+# Reuse the same quantizable linear class in both backends so the rest of the
+# training / export path can stay architecture-agnostic.
+mlp_base.CastedLinear = base.CastedLinear
 
 
 CastedLinear = base.CastedLinear
@@ -37,6 +42,7 @@ restore_low_dim_params_to_fp32 = base.restore_low_dim_params_to_fp32
 
 class Hyperparameters(base.Hyperparameters):
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    block_kind = os.environ.get("BLOCK_KIND", "hwnode").lower()
     val_tokens_limit = int(os.environ.get("VAL_TOKENS_LIMIT", 0))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
@@ -74,8 +80,9 @@ def load_validation_tokens(pattern: str, seq_len: int, token_limit: int = 0) -> 
 
 
 def configure_attention_backend() -> str:
-    base._HAS_FA3 = False
-    base.flash_attn_3_func = None
+    for module in (base, mlp_base):
+        module._HAS_FA3 = False
+        module.flash_attn_3_func = None
     if os.environ.get("USE_FA3", "1") != "1":
         return "sdpa"
     if getattr(torch.version, "hip", None):
@@ -92,8 +99,9 @@ def configure_attention_backend() -> str:
         from flash_attn_interface import flash_attn_func as flash_attn_3_func
     except Exception:
         return "sdpa"
-    base.flash_attn_3_func = flash_attn_3_func
-    base._HAS_FA3 = True
+    for module in (base, mlp_base):
+        module.flash_attn_3_func = flash_attn_3_func
+        module._HAS_FA3 = True
     return "fa3"
 
 
@@ -245,8 +253,8 @@ class HWNodeBlockV2(base.HWNodeBlock):
 base.HWNodeBlock = HWNodeBlockV2
 
 
-def make_model(args: Hyperparameters, device: torch.device) -> GPT:
-    model = GPT(
+def make_model(args: Hyperparameters, device: torch.device) -> nn.Module:
+    common_kwargs = dict(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         model_dim=args.model_dim,
@@ -267,9 +275,17 @@ def make_model(args: Hyperparameters, device: torch.device) -> GPT:
         ve_enabled=args.ve_enabled,
         ve_dim=args.ve_dim,
         ve_layers=args.ve_layers,
-        hwnode_state_dim=args.hwnode_state_dim,
-        hwnode_order=args.hwnode_order,
-    ).to(device).bfloat16()
+    )
+    if args.block_kind == "mlp":
+        model = mlp_base.GPT(**common_kwargs).to(device).bfloat16()
+    elif args.block_kind == "hwnode":
+        model = GPT(
+            **common_kwargs,
+            hwnode_state_dim=args.hwnode_state_dim,
+            hwnode_order=args.hwnode_order,
+        ).to(device).bfloat16()
+    else:
+        raise ValueError(f"Unsupported BLOCK_KIND={args.block_kind!r}; expected 'hwnode' or 'mlp'")
     for module in model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -657,6 +673,7 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     log0(f"attention_backend:{attention_backend} compile:{use_compile} fused_optim:{fused_optim}")
+    log0(f"block_kind:{args.block_kind}")
     log0(
         f"hwnode:state_dim={args.hwnode_state_dim} order={args.hwnode_order} "
         f"virtual_layers={args.hwnode_virtual_layers} "
