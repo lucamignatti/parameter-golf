@@ -118,10 +118,18 @@ def configure_sdp_backends() -> None:
     except Exception:
         return
     try:
-        enable_cudnn_sdp(False)
-        enable_flash_sdp(True)
-        enable_mem_efficient_sdp(False)
-        enable_math_sdp(False)
+        if getattr(torch.version, "hip", None):
+            # ROCm SDPA is much more reliable through the math backend, and its
+            # GQA path is not universally supported.
+            enable_cudnn_sdp(False)
+            enable_flash_sdp(False)
+            enable_mem_efficient_sdp(False)
+            enable_math_sdp(True)
+        else:
+            enable_cudnn_sdp(False)
+            enable_flash_sdp(True)
+            enable_mem_efficient_sdp(False)
+            enable_math_sdp(False)
     except Exception:
         pass
 
@@ -251,6 +259,54 @@ class HWNodeBlockV2(base.HWNodeBlock):
 
 
 base.HWNodeBlock = HWNodeBlockV2
+
+
+def _patch_attention_forward(module) -> None:
+    def forward(self, x: Tensor, v_embed: Tensor | None = None) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = self.c_v(x)
+        if v_embed is not None:
+            v = v + v_embed
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        q = module.apply_rotary_emb(q, cos, sin, self.rope_dims)
+        k = module.apply_rotary_emb(k, cos, sin, self.rope_dims)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        if module._HAS_FA3:
+            y = module.flash_attn_3_func(q, k, v, causal=True).contiguous()
+        else:
+            q_t = q.transpose(1, 2)
+            k_t = k.transpose(1, 2)
+            v_t = v.transpose(1, 2)
+            if self.num_kv_heads != self.num_heads and getattr(torch.version, "hip", None):
+                repeat = self.num_heads // self.num_kv_heads
+                k_t = k_t.repeat_interleave(repeat, dim=1)
+                v_t = v_t.repeat_interleave(repeat, dim=1)
+                y = F.scaled_dot_product_attention(
+                    q_t, k_t, v_t,
+                    attn_mask=None, is_causal=True,
+                    enable_gqa=False,
+                ).transpose(1, 2)
+            else:
+                y = F.scaled_dot_product_attention(
+                    q_t, k_t, v_t,
+                    attn_mask=None, is_causal=True,
+                    enable_gqa=(self.num_kv_heads != self.num_heads),
+                ).transpose(1, 2)
+        if self.use_xsa:
+            y = self._xsa_efficient(y, v)
+        y = y.reshape(bsz, seqlen, dim)
+        return self.proj(y)
+
+    module.CausalSelfAttention.forward = forward
+
+
+_patch_attention_forward(base)
+_patch_attention_forward(mlp_base)
 
 
 def make_model(args: Hyperparameters, device: torch.device) -> nn.Module:
