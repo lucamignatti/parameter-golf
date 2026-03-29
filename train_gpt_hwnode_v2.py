@@ -59,10 +59,14 @@ class Hyperparameters(base.Hyperparameters):
     ngram_entropy_center = float(os.environ.get("NGRAM_ENTROPY_CENTER", 3.0))
     ngram_entropy_scale = float(os.environ.get("NGRAM_ENTROPY_SCALE", 2.0))
     ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", 2))
-    hwnode_virtual_layers = int(os.environ.get("HWNODE_VIRTUAL_LAYERS", 2))
-    hwnode_term_gates = bool(int(os.environ.get("HWNODE_TERM_GATES", "0")))
-    hwnode_state_bias = bool(int(os.environ.get("HWNODE_STATE_BIAS", "0")))
-    hwnode_term_gate_init = float(os.environ.get("HWNODE_TERM_GATE_INIT", "1.0"))
+    hwnode_state_dim = int(os.environ.get("HWNODE_STATE_DIM", 55))
+    hwnode_virtual_layers = int(os.environ.get("HWNODE_VIRTUAL_LAYERS", 6))
+    hwnode_delta_min = float(os.environ.get("HWNODE_DELTA_MIN", 0.01))
+    hwnode_delta_max = float(os.environ.get("HWNODE_DELTA_MAX", 0.25))
+    hwnode_delta_init = float(os.environ.get("HWNODE_DELTA_INIT", 0.10))
+    hwnode_alpha_max = float(os.environ.get("HWNODE_ALPHA_MAX", 0.5))
+    hwnode_alpha_init = float(os.environ.get("HWNODE_ALPHA_INIT", 0.05))
+    hwnode_stability_eps = float(os.environ.get("HWNODE_STABILITY_EPS", 1e-3))
     hwnode_a_int8 = bool(int(os.environ.get("HWNODE_A_INT8", "0")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
 
@@ -73,12 +77,12 @@ def mixed_quantize_int6_v2(
     *,
     hwnode_a_int8: bool = False,
 ):
-    """Quantize like the base exporter, with an optional int8 override for A_weight.
+    """Quantize like the base exporter, with an optional int8 override for S/L.
 
-    The shared HWNODE dynamics matrix is applied repeatedly across virtual depth
-    steps, so quantization noise there compounds more than in a standard MLP.
-    This hook lets us keep that matrix on the less aggressive int8 path while
-    leaving the rest of the model unchanged.
+    The shared HWNODE dynamics matrices are reused across every virtual-depth
+    step, so quantization noise there compounds more than in a standard MLP.
+    This hook lets us keep those matrices on the less aggressive int8 path
+    while leaving the rest of the model unchanged.
     """
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
@@ -93,7 +97,7 @@ def mixed_quantize_int6_v2(
             result[name] = t.float()
             meta[name] = "passthrough_ctrl"
             continue
-        if hwnode_a_int8 and name.endswith(".hwnode.A_weight"):
+        if hwnode_a_int8 and base._is_hwnode_dynamics_param(name):
             q, s = base.quantize_float_tensor(t)
             result[name + ".q"] = q
             result[name + ".scale"] = s
@@ -235,73 +239,7 @@ def make_adam(params, *, lr: float, betas: tuple[float, float], eps: float, fuse
 
 
 class HWNodeBlockV2(base.HWNodeBlock):
-    """Shared-depth Hammerstein-Wiener Neural ODE block.
-
-    This is the intended HWNODE construction:
-
-        h_0 = x
-        z_l(0) = phi(W_in h_l)
-        z_l(Δt) = exp(A Δt) z_l(0)
-        h_{l+1} = psi(W_out z_l(Δt))
-
-    for l = 0, ..., L-1, with the SAME parameters reused at every virtual
-    depth step. The Taylor expansion only approximates exp(A Δt); the virtual
-    depth itself comes from repeatedly applying this shared HW step.
-    """
-
-    def __init__(self, dim: int, state_dim: int, order: int = 3):
-        super().__init__(dim, state_dim, order=order)
-        self.num_virtual_layers = int(os.environ.get("HWNODE_VIRTUAL_LAYERS", "2"))
-        self.use_term_gates = os.environ.get("HWNODE_TERM_GATES", "0") == "1"
-        self.use_state_bias = os.environ.get("HWNODE_STATE_BIAS", "0") == "1"
-        gate_init = float(os.environ.get("HWNODE_TERM_GATE_INIT", "1.0"))
-        if self.use_term_gates:
-            self.term_gates = nn.Parameter(torch.full((order,), gate_init, dtype=torch.float32))
-        else:
-            self.register_parameter("term_gates", None)
-        if self.use_state_bias:
-            self.state_bias = nn.Parameter(torch.zeros(state_dim, dtype=torch.float32))
-        else:
-            self.register_parameter("state_bias", None)
-
-    def _exp_A(self, device, dtype):
-        use_cache = not self.training and not torch.is_grad_enabled()
-        if use_cache and self._cached_exp_A is not None:
-            return self._cached_exp_A
-
-        A_normed = self._spectral_norm_A()
-        A = (A_normed * self.dt).to(dtype=dtype)
-        I = torch.eye(A.shape[0], device=device, dtype=dtype)
-        result, Ak = I.clone(), I.clone()
-        if self.term_gates is None:
-            for k in range(1, self.order + 1):
-                Ak = Ak @ A / k
-                result = result + Ak
-        else:
-            gates = self.term_gates.to(dtype=dtype)
-            for k in range(1, self.order + 1):
-                Ak = Ak @ A / k
-                result = result + gates[k - 1] * Ak
-
-        if use_cache:
-            self._cached_exp_A = result
-        return result
-
-    def _shared_hwnode_step(self, x: Tensor, exp_a: Tensor) -> Tensor:
-        """Apply one shared HWNODE step."""
-        z = F.leaky_relu(self.fc(x), negative_slope=0.5)
-        z = z @ exp_a.T
-        if self.state_bias is not None:
-            z = z + self.state_bias.to(dtype=z.dtype)[None, None, :]
-        y = self.proj(z)
-        return F.leaky_relu(y, negative_slope=0.5).square()
-
-    def forward(self, x: Tensor) -> Tensor:
-        exp_a = self._exp_A(x.device, x.dtype)
-        h = x
-        for _ in range(self.num_virtual_layers):
-            h = self._shared_hwnode_step(h, exp_a)
-        return h
+    """Compatibility wrapper for the virtual-depth residual HWNODE."""
 
 
 base.HWNodeBlock = HWNodeBlockV2
@@ -777,10 +715,10 @@ def main() -> None:
     log0(f"attention_backend:{attention_backend} compile:{use_compile} fused_optim:{fused_optim}")
     log0(f"block_kind:{args.block_kind}")
     log0(
-        f"hwnode:state_dim={args.hwnode_state_dim} order={args.hwnode_order} "
-        f"virtual_layers={args.hwnode_virtual_layers} "
-        f"term_gates={args.hwnode_term_gates} state_bias={args.hwnode_state_bias} "
-        f"a_int8={args.hwnode_a_int8}"
+        f"hwnode:state_dim={args.hwnode_state_dim} virtual_layers={args.hwnode_virtual_layers} "
+        f"delta=[{args.hwnode_delta_min},{args.hwnode_delta_max}] init={args.hwnode_delta_init} "
+        f"alpha_max={args.hwnode_alpha_max} alpha_init={args.hwnode_alpha_init} "
+        f"stability_eps={args.hwnode_stability_eps} a_int8={args.hwnode_a_int8}"
     )
     log0(f"ngram:enabled={args.ngram_enabled} orders={args.ngram_min_order}-{args.ngram_max_order} buckets={args.ngram_num_buckets}")
 
@@ -811,12 +749,12 @@ def main() -> None:
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in base.CONTROL_TENSOR_NAME_PATTERNS) and "A_weight" not in name
+        if p.ndim == 2 and not any(pattern in name for pattern in base.CONTROL_TENSOR_NAME_PATTERNS) and not base._is_hwnode_dynamics_param(name)
     ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in base.CONTROL_TENSOR_NAME_PATTERNS) or "A_weight" in name
+        if p.ndim < 2 or any(pattern in name for pattern in base.CONTROL_TENSOR_NAME_PATTERNS) or base._is_hwnode_dynamics_param(name)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)

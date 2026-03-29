@@ -163,8 +163,15 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.5))
-    hwnode_state_dim = int(os.environ.get("HWNODE_STATE_DIM", 864))
+    hwnode_state_dim = int(os.environ.get("HWNODE_STATE_DIM", 55))
     hwnode_order = int(os.environ.get("HWNODE_ORDER", 2))
+    hwnode_virtual_layers = int(os.environ.get("HWNODE_VIRTUAL_LAYERS", 6))
+    hwnode_delta_min = float(os.environ.get("HWNODE_DELTA_MIN", 0.01))
+    hwnode_delta_max = float(os.environ.get("HWNODE_DELTA_MAX", 0.25))
+    hwnode_delta_init = float(os.environ.get("HWNODE_DELTA_INIT", 0.10))
+    hwnode_alpha_max = float(os.environ.get("HWNODE_ALPHA_MAX", 0.5))
+    hwnode_alpha_init = float(os.environ.get("HWNODE_ALPHA_INIT", 0.05))
+    hwnode_stability_eps = float(os.environ.get("HWNODE_STABILITY_EPS", 1e-3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -365,6 +372,10 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_Q = 0.9999984
 
+
+def _is_hwnode_dynamics_param(name: str) -> bool:
+    return ".hwnode.S" in name or ".hwnode.L" in name
+
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
@@ -499,7 +510,11 @@ class CastedLinear(nn.Linear):
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
         for name, param in module.named_parameters():
-            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+            if (
+                param.ndim < 2
+                or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+                or _is_hwnode_dynamics_param(name)
+            ) and param.dtype != torch.float32:
                 param.data = param.data.float()
 
 class Rotary(nn.Module):
@@ -658,78 +673,84 @@ class ValueEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 class HWNodeBlock(nn.Module):
-    """Hammerstein-Wiener Neural ODE block replacing standard FFN.
+    """Static residual virtual-depth Hammerstein-Wiener block.
 
-    Three-stage decomposition:
-      1. Hammerstein: W_in(d→n) → ReLU²   (compress)
-      2. ODE Core:   exp(A·Δt)·z           (dynamics, spectral-normed via power iteration)
-      3. Wiener:     ReLU² → W_out(n→d)    (expand)
-
-    The A matrix is spectral-normalized using a single-step power iteration
-    (maintaining u/v buffers), which is compile-safe (no parametrize hooks).
+    Each virtual layer reuses the same input/output projections and the same
+    stable continuous-time generator A = S - S^T - (L L^T + eps I), while only
+    the step size delta_k and residual scale alpha_k vary by depth.
     """
     def __init__(self, dim: int, state_dim: int, order: int = 3):
         super().__init__()
-        self.order = order
+        self.order = order  # retained for API compatibility
         self.state_dim = state_dim
         self.dim = dim
-        self.fc = CastedLinear(dim, state_dim, bias=False)
-        self.proj = CastedLinear(state_dim, dim, bias=False)
+        self.num_virtual_layers = int(os.environ.get("HWNODE_VIRTUAL_LAYERS", "6"))
+        self.delta_min = float(os.environ.get("HWNODE_DELTA_MIN", "0.01"))
+        self.delta_max = float(os.environ.get("HWNODE_DELTA_MAX", "0.25"))
+        self.alpha_max = float(os.environ.get("HWNODE_ALPHA_MAX", "0.5"))
+        self.stability_eps = float(os.environ.get("HWNODE_STABILITY_EPS", "1e-3"))
+        delta_init = float(os.environ.get("HWNODE_DELTA_INIT", "0.10"))
+        alpha_init = float(os.environ.get("HWNODE_ALPHA_INIT", "0.05"))
+        self.fc = CastedLinear(dim, state_dim, bias=True)
+        self.proj = CastedLinear(state_dim, dim, bias=True)
         self.proj._zero_init = True
-        self.A_weight = nn.Parameter(torch.empty(state_dim, state_dim))
-        nn.init.normal_(self.A_weight, std=0.1)
-        self.dt = nn.Parameter(torch.ones(1))
-        self.register_buffer('_pi_u', F.normalize(torch.randn(state_dim), dim=0), persistent=False)
-        self.register_buffer('_pi_v', F.normalize(torch.randn(state_dim), dim=0), persistent=False)
-        self.register_buffer('_cached_exp_A', None, persistent=False)
+        self.S = nn.Parameter(torch.empty(state_dim, state_dim))
+        self.L = nn.Parameter(torch.empty(state_dim, state_dim))
+        nn.init.normal_(self.S, std=0.02)
+        nn.init.normal_(self.L, std=0.02)
+        self.delta_logits = nn.Parameter(torch.full((self.num_virtual_layers,), self._inverse_sigmoid(self._normalize_init(delta_init, self.delta_min, self.delta_max)), dtype=torch.float32))
+        self.alpha_logits = nn.Parameter(torch.full((self.num_virtual_layers,), self._inverse_sigmoid(self._normalize_init(alpha_init, 0.0, self.alpha_max)), dtype=torch.float32))
+        if self.fc.bias is not None:
+            nn.init.zeros_(self.fc.bias)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
 
-    def train(self, mode: bool = True):
-        super().train(mode)
-        if mode:
-            self._cached_exp_A = None
-        return self
+    @staticmethod
+    def _inverse_sigmoid(value: float) -> float:
+        value = min(max(value, 1e-4), 1.0 - 1e-4)
+        return math.log(value / (1.0 - value))
 
-    def _spectral_norm_A(self) -> Tensor:
-        A = self.A_weight
-        with torch.no_grad():
-            u = self._pi_u
-            v_new = F.normalize(A.T @ u, dim=0)
-            u_new = F.normalize(A @ v_new, dim=0)
-            self._pi_u.copy_(u_new)
-            self._pi_v.copy_(v_new)
-        u_final = self._pi_u.clone().detach()
-        v_final = self._pi_v.clone().detach()
-        sigma = (u_final @ A @ v_final).clamp(min=1e-8)
-        return A / sigma
+    @staticmethod
+    def _normalize_init(value: float, low: float, high: float) -> float:
+        if high <= low:
+            raise ValueError(f"expected high > low, got low={low} high={high}")
+        clipped = min(max(value, low + 1e-4), high - 1e-4)
+        return (clipped - low) / (high - low)
 
-    def _exp_A(self, device, dtype):
-        use_cache = not self.training and not torch.is_grad_enabled()
-        if use_cache and self._cached_exp_A is not None:
-            return self._cached_exp_A
+    def _bounded_sigmoid(self, logits: Tensor, low: float, high: float) -> Tensor:
+        return low + (high - low) * torch.sigmoid(logits)
 
-        A_normed = self._spectral_norm_A()
-        A = (A_normed * self.dt).to(dtype=dtype)
-        I = torch.eye(A.shape[0], device=device, dtype=dtype)
-        result, Ak = I.clone(), I.clone()
-        for k in range(1, self.order + 1):
-            Ak = Ak @ A / k
-            result = result + Ak
-            
-        if use_cache:
-            self._cached_exp_A = result
-
-        return result
+    def _continuous_generator(self, device: torch.device) -> Tensor:
+        s = self.S.float()
+        l = self.L.float()
+        ident = torch.eye(self.state_dim, device=device, dtype=torch.float32)
+        return (s - s.transpose(0, 1)) - (l @ l.transpose(0, 1) + self.stability_eps * ident)
 
     def forward(self, x: Tensor) -> Tensor:
-        z = F.leaky_relu(self.fc(x), negative_slope=0.5)
-        z = z @ self._exp_A(x.device, x.dtype).T
-        return self.proj(F.leaky_relu(z, negative_slope=0.5).square())
+        a = self._continuous_generator(x.device)
+        ident = torch.eye(self.state_dim, device=x.device, dtype=torch.float32)
+        deltas = self._bounded_sigmoid(self.delta_logits, self.delta_min, self.delta_max)
+        alphas = self._bounded_sigmoid(self.alpha_logits, 0.0, self.alpha_max)
+        h = x
+        for idx in range(self.num_virtual_layers):
+            z0 = F.relu(self.fc(h))
+            delta = deltas[idx].to(device=x.device, dtype=torch.float32)
+            left = ident - 0.5 * delta * a
+            right = ident + 0.5 * delta * a
+            abar = torch.linalg.solve(left, right)
+            z1 = torch.matmul(z0.float(), abar.transpose(0, 1)).to(dtype=z0.dtype)
+            u = self.proj(z1)
+            alpha = alphas[idx].to(device=x.device, dtype=u.dtype)
+            h = h + alpha * u
+            if idx + 1 < self.num_virtual_layers:
+                h = F.relu(h)
+        return h
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  rope_base: float, qk_gain_init: float, layer_idx: int = 0,
                  ln_scale: bool = False, dtg: bool = False,
-                 hwnode_state_dim: int = 864, hwnode_order: int = 2):
+                 hwnode_state_dim: int = 55, hwnode_order: int = 2):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -751,7 +772,9 @@ class Block(nn.Module):
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.hwnode(self.mlp_norm(x_out) * self.ln_scale_factor)
+        mlp_in = self.mlp_norm(x_out) * self.ln_scale_factor
+        mlp_out = self.hwnode(mlp_in)
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * (mlp_out - mlp_in)
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
             x_out = x_in + gate * (x_out - x_in)
@@ -764,7 +787,7 @@ class GPT(nn.Module):
                  bigram_vocab_size: int = 0, bigram_dim: int = 128, xsa_last_n: int = 0,
                  rope_dims: int = 0, ln_scale: bool = False, dtg: bool = False,
                  ve_enabled: bool = False, ve_dim: int = 128, ve_layers: str = "9,10",
-                 hwnode_state_dim: int = 864, hwnode_order: int = 2):
+                 hwnode_state_dim: int = 55, hwnode_order: int = 2):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)
         if logit_softcap <= 0.0:
@@ -1414,12 +1437,12 @@ def main() -> None:
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS) and "A_weight" not in name
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS) and not _is_hwnode_dynamics_param(name)
     ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS) or "A_weight" in name
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS) or _is_hwnode_dynamics_param(name)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
