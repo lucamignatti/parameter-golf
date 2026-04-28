@@ -1,0 +1,29 @@
+{
+  "author": "lucamignatti",
+  "github_id": "lucamignatti",
+  "name": "Draft: SP8192 + VDN MLP + 3-Layer Recurrence + Parallel Residuals + QK-Gain 5.25 + Legal Score-First TTT",
+  "date": "2026-04-28",
+  "track": "10min_16mb",
+  "draft": true,
+  "val_bpb": null,
+  "seeds": [],
+  "base_record": "records/track_10min_16mb/2026-04-09_SP8192_3LayerRecur_ParResid_QK525_LegalTTT",
+  "default_candidate": {
+    "VDN_ENABLED": 1,
+    "VDN_LAYERS": "all",
+    "VDN_HIDDEN": 640,
+    "VDN_STEPS": 2,
+    "VDN_DISCRETIZATION": "neumann_tustin",
+    "VDN_INVERSE_TERMS": 1
+  },
+  "compliance_intent": {
+    "train_under_600s": null,
+    "artifact_under_16mb": null,
+    "eval_under_600s": null,
+    "score_first_ttt": true,
+    "no_slot": true,
+    "no_pre_quant_ttt": true,
+    "no_etlb": true,
+    "no_ngram_cache": true
+  }
+}
