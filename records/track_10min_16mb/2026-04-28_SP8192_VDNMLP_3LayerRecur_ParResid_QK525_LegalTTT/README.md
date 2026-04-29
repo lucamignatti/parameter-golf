@@ -5,10 +5,10 @@ This is an experimental VDN-on-SOTA candidate derived from `2026-04-09_SP8192_3L
 The only intended architectural change is replacing selected transformer MLP sublayers with an ODE-style VDN MLP. The default candidate is:
 
 ```bash
-VDN_ENABLED=1 VDN_LAYERS=all VDN_HIDDEN=640 VDN_STEPS=8 VDN_INIT_STEP_SIZE=0.125 VDN_ALPHA_INIT=0.125 VDN_DISCRETIZATION=neumann_tustin VDN_INVERSE_TERMS=1
+VDN_ENABLED=1 VDN_LAYERS=all VDN_HIDDEN=640 VDN_STEPS=8 VDN_INIT_STEP_SIZE=0.125 VDN_ALPHA_INIT=0.125 VDN_DISCRETIZATION=neumann_tustin VDN_INVERSE_TERMS=1 VDN_MANIFOLD=hermite VDN_MANIFOLD_SCALE=0.25 VDN_HERMITE_KNOTS=4
 ```
 
-For same-script baseline reproduction, set `VDN_ENABLED=0`. For recurrent-layer-only ablations, set `VDN_LAYERS=3,4,5`. For speed fallback, set `VDN_DISCRETIZATION=euler`.
+For same-script baseline reproduction, set `VDN_ENABLED=0`. For recurrent-layer-only ablations, set `VDN_LAYERS=3,4,5`. For old shared-step VDN behavior, set `VDN_MANIFOLD=shared`. For speed fallback, set `VDN_DISCRETIZATION=euler`.
 
 ## Candidate Runs
 
@@ -34,6 +34,7 @@ Primary VDN candidate A:
 DATA_DIR=../../../data/ SEED=42 VDN_ENABLED=1 VDN_LAYERS=all VDN_HIDDEN=640 VDN_STEPS=8 \
   VDN_INIT_STEP_SIZE=0.125 VDN_ALPHA_INIT=0.125 \
   VDN_DISCRETIZATION=neumann_tustin VDN_INVERSE_TERMS=1 \
+  VDN_MANIFOLD=hermite VDN_MANIFOLD_SCALE=0.25 VDN_HERMITE_KNOTS=4 \
   QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
   torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```

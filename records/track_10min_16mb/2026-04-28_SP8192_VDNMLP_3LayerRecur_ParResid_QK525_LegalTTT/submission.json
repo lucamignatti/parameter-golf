@@ -17,7 +17,10 @@
     "VDN_INVERSE_TERMS": 1,
     "VDN_INIT_STEP_SIZE": 0.125,
     "VDN_ALPHA_INIT": 0.125,
-    "VDN_INTERNAL_NORM": 1
+    "VDN_INTERNAL_NORM": 1,
+    "VDN_MANIFOLD": "hermite",
+    "VDN_MANIFOLD_SCALE": 0.25,
+    "VDN_HERMITE_KNOTS": 4
   },
   "compliance_intent": {
     "train_under_600s": null,
