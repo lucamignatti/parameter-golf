@@ -2,13 +2,13 @@
 
 This is an experimental VDN-on-SOTA candidate derived from `2026-04-09_SP8192_3LayerRecur_ParResid_QK525_LegalTTT`. It keeps the SP8192 tokenizer, 3-layer recurrence, parallel residuals, QK gain, MuonEq-R, GPTQ SDClip, Brotli compression, and legal score-first TTT path from that record.
 
-The only intended architectural change is replacing selected transformer MLP sublayers with a PR #818-style HWNODE/VDN MLP. The default candidate is:
+The only intended architectural change is replacing selected transformer MLP sublayers with an ODE-style VDN MLP. The default candidate is:
 
 ```bash
-VDN_ENABLED=1 VDN_MODE=hwnode VDN_LAYERS=all VDN_HIDDEN=864 VDN_ORDER=2
+VDN_ENABLED=1 VDN_LAYERS=all VDN_HIDDEN=640 VDN_STEPS=8 VDN_INIT_STEP_SIZE=0.125 VDN_ALPHA_INIT=0.125 VDN_DISCRETIZATION=neumann_tustin VDN_INVERSE_TERMS=1
 ```
 
-For same-script baseline reproduction, set `VDN_ENABLED=0`. For recurrent-layer-only ablations, set `VDN_LAYERS=3,4,5`. The older repeated-step VDN path remains available with `VDN_MODE=vdn`.
+For same-script baseline reproduction, set `VDN_ENABLED=0`. For recurrent-layer-only ablations, set `VDN_LAYERS=3,4,5`. For speed fallback, set `VDN_DISCRETIZATION=euler`.
 
 ## Candidate Runs
 
@@ -31,7 +31,9 @@ DATA_DIR=../../../data/ SEED=42 VDN_ENABLED=0 QK_GAIN_INIT=5.25 \
 Primary VDN candidate A:
 
 ```bash
-DATA_DIR=../../../data/ SEED=42 VDN_ENABLED=1 VDN_MODE=hwnode VDN_LAYERS=all VDN_HIDDEN=864 VDN_ORDER=2 \
+DATA_DIR=../../../data/ SEED=42 VDN_ENABLED=1 VDN_LAYERS=all VDN_HIDDEN=640 VDN_STEPS=8 \
+  VDN_INIT_STEP_SIZE=0.125 VDN_ALPHA_INIT=0.125 \
+  VDN_DISCRETIZATION=neumann_tustin VDN_INVERSE_TERMS=1 \
   QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
   torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
@@ -45,19 +47,19 @@ MATRIX_BITS=7 MATRIX_CLIP_SIGMAS=12.85 ...
 Candidate C increases latent width:
 
 ```bash
-VDN_HIDDEN=960 ...
+VDN_HIDDEN=704 ...
 ```
 
 Candidate D limits VDN to the recurrent physical layers:
 
 ```bash
-VDN_LAYERS=3,4,5 VDN_MODE=hwnode VDN_HIDDEN=864 VDN_ORDER=2 ...
+VDN_LAYERS=3,4,5 VDN_STEPS=8 VDN_INIT_STEP_SIZE=0.125 VDN_ALPHA_INIT=0.125 ...
 ```
 
-Fallback repeated-step VDN ablation:
+Fallback speed ablation:
 
 ```bash
-VDN_MODE=vdn VDN_DISCRETIZATION=euler VDN_STEPS=8 ...
+VDN_DISCRETIZATION=euler ...
 ```
 
 Promotion gates: train under 600s, sliding + TTT eval under 600s, artifact under 16,000,000 bytes, and no change to score-first TTT ordering.
