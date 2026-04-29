@@ -5,7 +5,7 @@ This is an experimental VDN-on-SOTA candidate derived from `2026-04-09_SP8192_3L
 The only intended architectural change is replacing selected transformer MLP sublayers with an ODE-style VDN MLP. The default candidate is:
 
 ```bash
-VDN_ENABLED=1 VDN_LAYERS=all VDN_HIDDEN=640 VDN_STEPS=2 VDN_DISCRETIZATION=neumann_tustin VDN_INVERSE_TERMS=1
+VDN_ENABLED=1 VDN_LAYERS=all VDN_HIDDEN=640 VDN_STEPS=8 VDN_DISCRETIZATION=neumann_tustin VDN_INVERSE_TERMS=1
 ```
 
 For same-script baseline reproduction, set `VDN_ENABLED=0`. For recurrent-layer-only ablations, set `VDN_LAYERS=3,4,5`. For speed fallback, set `VDN_DISCRETIZATION=euler`.
@@ -31,7 +31,7 @@ DATA_DIR=../../../data/ SEED=42 VDN_ENABLED=0 QK_GAIN_INIT=5.25 \
 Primary VDN candidate A:
 
 ```bash
-DATA_DIR=../../../data/ SEED=42 VDN_ENABLED=1 VDN_LAYERS=all VDN_HIDDEN=640 VDN_STEPS=2 \
+DATA_DIR=../../../data/ SEED=42 VDN_ENABLED=1 VDN_LAYERS=all VDN_HIDDEN=640 VDN_STEPS=8 \
   VDN_DISCRETIZATION=neumann_tustin VDN_INVERSE_TERMS=1 \
   QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
   torchrun --standalone --nproc_per_node=8 train_gpt.py
@@ -52,7 +52,7 @@ VDN_HIDDEN=704 ...
 Candidate D limits VDN to the recurrent physical layers:
 
 ```bash
-VDN_LAYERS=3,4,5 ...
+VDN_LAYERS=3,4,5 VDN_STEPS=8 ...
 ```
 
 Fallback speed ablation:

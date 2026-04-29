@@ -12,7 +12,7 @@
     "VDN_ENABLED": 1,
     "VDN_LAYERS": "all",
     "VDN_HIDDEN": 640,
-    "VDN_STEPS": 2,
+    "VDN_STEPS": 8,
     "VDN_DISCRETIZATION": "neumann_tustin",
     "VDN_INVERSE_TERMS": 1
   },
