@@ -10,14 +10,10 @@
   "base_record": "records/track_10min_16mb/2026-04-09_SP8192_3LayerRecur_ParResid_QK525_LegalTTT",
   "default_candidate": {
     "VDN_ENABLED": 1,
+    "VDN_MODE": "hwnode",
     "VDN_LAYERS": "all",
-    "VDN_HIDDEN": 640,
-    "VDN_STEPS": 8,
-    "VDN_DISCRETIZATION": "neumann_tustin",
-    "VDN_INVERSE_TERMS": 1,
-    "VDN_INIT_STEP_SIZE": 0.125,
-    "VDN_ALPHA_INIT": 0.125,
-    "VDN_INTERNAL_NORM": 1
+    "VDN_HIDDEN": 864,
+    "VDN_ORDER": 2
   },
   "compliance_intent": {
     "train_under_600s": null,
